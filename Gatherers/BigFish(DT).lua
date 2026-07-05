@@ -65,6 +65,35 @@ configs:
       输入精确的鱼名后按回车，每行一条。
       钓到鱼后可手动将其从轮换中移除。
     default: []
+  SkipCaughtFish:
+    description: |
+      启用后，已成功钓获的鱼会被自动记录并跳过。
+      记录会跨脚本重启持久保存。
+      可在下方 CaughtFishRecord 中查看或清除记录。
+    default: false
+  CaughtFishRecord:
+    description: |
+      已捕获鱼类的自动记录（逗号分隔）。
+      启用 SkipCaughtFish 后，脚本会自动维护此列表。
+      清空此字段可重置记录，重新尝试所有鱼。
+    default: ""
+  ImportCaughtFishIds:
+    description: |
+      通过物品ID批量导入已捕获记录（逗号分隔）。
+      脚本启动时会自动将这些ID解析为鱼名并合并到 CaughtFishRecord 中。
+      可在 XIVAPI、EXDViewer 或 Garland Tools 查询鱼的物品ID。
+      导入完成后可清空此字段，已导入的记录会保留在 CaughtFishRecord 中。
+      仅在 SkipCaughtFish 启用时生效。
+    default: ""
+  ImportFromFishcake:
+    description: |
+      从鱼糕（ffmomola）导出文件导入已捕获记录。
+      将鱼糕导出的 JSON 内容直接粘贴到此处，脚本启动时会自动解析
+      completed 列表中的物品ID并合并到 CaughtFishRecord 中。
+      仅导入当前 FishData 中存在的鱼，其他扩展的鱼会被忽略。
+      导入完成后可清空此字段，已导入的记录会保留在 CaughtFishRecord 中。
+      仅在 SkipCaughtFish 启用时生效。
+    default: ""
 
 [[End Metadata]]
 --]=====]
@@ -79,6 +108,14 @@ configs:
 -- 6. MissFisher 中已为每条鱼同步了对应的预设（preset）
 --    脚本通过 /mf preset <鱼名> 命令启动钓鱼，请确保预设名称与鱼名一致
 -- 7. 如启用了空闲传送（UseIdleTeleport），请在 Lifestream 中设置 auto 目标
+-- 8. 如启用了跳过已捕获鱼（SkipCaughtFish），脚本会自动记录已钓获的鱼并跳过。
+--    记录保存在 CaughtFishRecord 配置项中，清空该字段可重置记录。
+-- 9. 可通过 ImportCaughtFishIds 填入鱼的物品ID（逗号分隔）批量导入已捕获记录。
+--    脚本启动时会自动解析ID为鱼名并合并到记录中，导入后该字段自动清空。
+--    可在 XIVAPI、EXDViewer 或 Garland Tools 查询鱼的物品ID。
+-- 10. 可通过 ImportFromFishcake 粘贴鱼糕（ffmomola）导出的JSON内容来批量导入。
+--    脚本会自动解析 completed 列表中的物品ID并匹配FishData中的鱼。
+--    仅导入7.0 FishData中存在的鱼，其他扩展的鱼会被跳过。导入后该字段自动清空。
 --================================================================--
 
 --========================== 依赖导入 ============================--
@@ -99,6 +136,9 @@ MissFisherStopCommand      = Config.Get("MissFisherStopCommand")
 UseIdleTeleport            = Config.Get("UseIdleTeleport")
 ForceQuitDelaySeconds      = Config.Get("ForceQuitDelaySeconds")
 SwimBaitPrepSeconds        = Config.Get("SwimBaitPrepSeconds")
+SkipCaughtFish             = Config.Get("SkipCaughtFish")
+ImportCaughtFishIds        = Config.Get("ImportCaughtFishIds")
+ImportFromFishcake         = Config.Get("ImportFromFishcake")
 LogPrefix                  = "[BigFish]"
 
 local idleHoldoff          = 60
@@ -106,6 +146,7 @@ local idleHoldoff          = 60
 local lastAttempt          = {}
 local disabledFish         = {}
 local enabledFish          = {}
+local caughtFishRecord     = {}
 local baitItemIds          = {}
 local missingBaitLog       = {}
 local unknownFishLog       = {}
@@ -1299,6 +1340,192 @@ function BuildBaitItemIdMap()
     Dalamud.Log(string.format("%s 已加载鱼饵物品ID映射表。", LogPrefix))
 end
 
+function LoadCaughtFishRecord()
+    caughtFishRecord = {}
+    local recordStr = Config.Get("CaughtFishRecord")
+    if type(recordStr) == "string" and recordStr ~= "" then
+        for fishName in recordStr:gmatch("[^,]+") do
+            local trimmed = fishName:gsub("^%s+", ""):gsub("%s+$", "")
+            if trimmed ~= "" then
+                caughtFishRecord[trimmed] = true
+            end
+        end
+    end
+    local count = 0
+    for _ in pairs(caughtFishRecord) do
+        count = count + 1
+    end
+    Dalamud.Log(string.format("%s 已加载已捕获记录: %d 条", LogPrefix, count))
+end
+
+function ResolveFishNameByItemId(itemId)
+    itemId = tonumber(itemId)
+    if not itemId or itemId <= 0 then
+        return nil
+    end
+    local itemRow = Excel.GetRow("Item", itemId)
+    if not itemRow then
+        Dalamud.Log(string.format("%s 物品ID %d 未找到对应数据。", LogPrefix, itemId))
+        return nil
+    end
+    local name = itemRow.Name
+    if not name then
+        Dalamud.Log(string.format("%s 物品ID %d 无法获取名称。", LogPrefix, itemId))
+        return nil
+    end
+    local fishName = tostring(name)
+    if fishName == "" or fishName == "nil" then
+        Dalamud.Log(string.format("%s 物品ID %d 名称为空。", LogPrefix, itemId))
+        return nil
+    end
+    return fishName
+end
+
+function ImportCaughtFishByIds()
+    if not SkipCaughtFish then
+        return
+    end
+    if type(ImportCaughtFishIds) ~= "string" or ImportCaughtFishIds == "" then
+        return
+    end
+
+    local imported = 0
+    local failed = 0
+    for idStr in ImportCaughtFishIds:gmatch("[^,]+") do
+        local trimmed = idStr:gsub("^%s+", ""):gsub("%s+$", "")
+        if trimmed ~= "" then
+            local fishName = ResolveFishNameByItemId(trimmed)
+            if fishName then
+                if not caughtFishRecord[fishName] then
+                    caughtFishRecord[fishName] = true
+                    imported = imported + 1
+                    Dalamud.Log(string.format("%s 通过物品ID %s 导入已捕获: %s", LogPrefix, trimmed, fishName))
+                end
+            else
+                failed = failed + 1
+            end
+        end
+    end
+
+    if imported > 0 then
+        SaveCaughtFishRecord()
+        Dalamud.Log(string.format("%s 物品ID导入完成: 成功 %d 条, 失败 %d 条。", LogPrefix, imported, failed))
+        Config.Set("ImportCaughtFishIds", "")
+        Dalamud.Log(string.format("%s 已清空 ImportCaughtFishIds（导入的记录已合并到 CaughtFishRecord）。", LogPrefix))
+    elseif failed > 0 then
+        Dalamud.Log(string.format("%s 物品ID导入失败: %d 条均未找到。请检查ID是否正确。", LogPrefix, failed))
+    end
+end
+
+function BuildFishDataNameSet()
+    local nameSet = {}
+    for _, fish in ipairs(FishData) do
+        local fishName = GetFishName(fish)
+        if fishName then
+            nameSet[fishName] = true
+        end
+    end
+    return nameSet
+end
+
+function ParseFishcakeJson(jsonStr)
+    local ids = {}
+    local completedSection = jsonStr:match('"completed"%s*:%s*%[(.-)%]')
+    if not completedSection then
+        Dalamud.Log(string.format("%s 鱼糕JSON解析失败: 未找到 completed 字段。", LogPrefix))
+        return ids
+    end
+    for idStr in completedSection:gmatch("%d+") do
+        local id = tonumber(idStr)
+        if id then
+            table.insert(ids, id)
+        end
+    end
+    return ids
+end
+
+function ImportFromFishcakeJson()
+    if not SkipCaughtFish then
+        return
+    end
+    if type(ImportFromFishcake) ~= "string" or ImportFromFishcake == "" then
+        return
+    end
+
+    local fishcakeIds = ParseFishcakeJson(ImportFromFishcake)
+    if #fishcakeIds == 0 then
+        Dalamud.Log(string.format("%s 鱼糕JSON中未找到任何已捕获ID。", LogPrefix))
+        return
+    end
+
+    Dalamud.Log(string.format("%s 鱼糕JSON解析到 %d 个已捕获ID，开始匹配FishData...", LogPrefix, #fishcakeIds))
+
+    local validFishNames = BuildFishDataNameSet()
+    local imported = 0
+    local skipped = 0
+    local unresolved = 0
+
+    for _, itemId in ipairs(fishcakeIds) do
+        local fishName = ResolveFishNameByItemId(itemId)
+        if fishName then
+            if validFishNames[fishName] then
+                if not caughtFishRecord[fishName] then
+                    caughtFishRecord[fishName] = true
+                    imported = imported + 1
+                    Dalamud.Log(string.format("%s 鱼糕导入已捕获: %s (ID: %d)", LogPrefix, fishName, itemId))
+                end
+            else
+                skipped = skipped + 1
+            end
+        else
+            unresolved = unresolved + 1
+        end
+    end
+
+    if imported > 0 then
+        SaveCaughtFishRecord()
+    end
+
+    Dalamud.Log(string.format("%s 鱼糕导入完成: 导入 %d 条, 跳过(非FishData) %d 条, 未解析 %d 条, 总计 %d 条。",
+        LogPrefix, imported, skipped, unresolved, #fishcakeIds))
+
+    if imported > 0 then
+        Config.Set("ImportFromFishcake", "")
+        Dalamud.Log(string.format("%s 已清空 ImportFromFishcake（导入的记录已合并到 CaughtFishRecord）。", LogPrefix))
+    end
+end
+
+function SaveCaughtFishRecord()
+    local names = {}
+    for fishName in pairs(caughtFishRecord) do
+        table.insert(names, fishName)
+    end
+    table.sort(names)
+    local recordStr = table.concat(names, ",")
+    Config.Set("CaughtFishRecord", recordStr)
+    Dalamud.Log(string.format("%s 已保存已捕获记录: %d 条", LogPrefix, #names))
+end
+
+function IsFishAlreadyCaught(fish)
+    local fishName = GetFishName(fish)
+    if not fishName then
+        return false
+    end
+    return caughtFishRecord[fishName] == true
+end
+
+function MarkFishAsCaught(fish)
+    local fishName = GetFishName(fish)
+    if not fishName then
+        return
+    end
+    if not caughtFishRecord[fishName] then
+        caughtFishRecord[fishName] = true
+        SaveCaughtFishRecord()
+        Dalamud.Log(string.format("%s 已记录 %s 为已捕获。", LogPrefix, fishName))
+    end
+end
+
 function HasRequiredBait(fish)
     if not baitChecksReady then
         return true
@@ -1712,6 +1939,10 @@ function IsFishSelectable(fish)
         return false
     end
 
+    if SkipCaughtFish and IsFishAlreadyCaught(fish) then
+        return false
+    end
+
     local cooldownUntil = lastAttempt[GetFishStateKey(fish)]
     return IsFishAllowed(fish)
         and HasRequiredBait(fish)
@@ -2006,6 +2237,9 @@ function CharacterState.fishing()
         if catchMessage then
             Dalamud.Log(string.format("%s 捕获消息: %s", LogPrefix, catchMessage))
         end
+        if SkipCaughtFish then
+            MarkFishAsCaught(SelectedFish)
+        end
     elseif forcedQuit then
         Dalamud.Log(string.format("%s 的窗口已关闭，结束本次尝试。", LogPrefix, GetFishLogLabel(SelectedFish)))
     else
@@ -2033,6 +2267,9 @@ for _, fish in ipairs(FishData) do
 end
 
 BuildBaitItemIdMap()
+LoadCaughtFishRecord()
+ImportCaughtFishByIds()
+ImportFromFishcakeJson()
 
 if not (Player and Player.Job and Player.Job.Id == 18) then
     Dalamud.Log(string.format("%s 切换至捕鱼人。", LogPrefix))
