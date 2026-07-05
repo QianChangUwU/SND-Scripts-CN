@@ -1,6 +1,6 @@
 --[=====[
 [[SND Metadata]]
-author: Minnu (https://ko-fi.com/minnuverse) || 汉化: QianChang (https://github.com/QianChangUwU)
+author: 'Minnu (https://ko-fi.com/minnuverse) || 汉化: QianChang (https://github.com/QianChangUwU)'
 version: 3.0.0
 description: 鱼王（7.0）- 自动钓取已追踪的 7.0 鱼王。
 plugin_dependencies:
