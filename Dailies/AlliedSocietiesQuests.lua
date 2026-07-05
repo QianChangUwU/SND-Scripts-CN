@@ -1,7 +1,7 @@
 --[=====[
 [[SND Metadata]]
 author: 'pot0to (https://ko-fi.com/pot0to) || Maintainer: Minnu (https://ko-fi.com/minnuverse) || 汉化: QianChang (https://github.com/QianChangUwU)'
-version: 2.1.3
+version: 2.1.4
 description: 蛮族日常任务 - 自动领取并完成指定蛮族的日常任务
 plugin_dependencies:
 - Questionable
@@ -186,6 +186,12 @@ configs:
 
 自动前往指定的蛮族据点，接取 3 个日常任务，完成后前往下一个蛮族据点。
 
+    -> 2.1.4    修复 Questionable 接取任务超时问题
+                1. 超时计时器仅在 Questionable 未运行时计数（运行中视为正在处理）
+                2. 移除 vnavmesh.Stop() 避免打断 Questionable 自身寻路
+                3. 移除施法取消避免打断 Questionable 传送
+                4. 超时阈值从15秒提升至30秒（仅计停止时间）
+                5. 轮询间隔从0.1秒提升至0.5秒减少开销
     -> 2.1.3    修复 Questionable 任务接取问题，增强日志输出
     -> 2.1.2    为 2.0 蛮族添加等级专属任务发布者支持
     -> 2.1.1    修复 ManualQuestPickup 关闭时无法接取任务的问题
@@ -865,18 +871,25 @@ for _, alliedSociety in ipairs(ToDoList) do
                         timeout = os.time()
 
                         repeat
-                            if not IPC.Questionable.IsRunning() and not Quests.IsQuestAccepted(questId) then
-                                yield("/qst start")
-                            elseif Svc.Condition[CharacterCondition.casting] then
-                                yield("/vnav movedir 0 0 0.5")  -- 微调移动以取消施法
-                            elseif IPC.vnavmesh.IsRunning() then
-                                IPC.vnavmesh.Stop()
-                            elseif os.time() - timeout > 15 then
-                                Dalamud.Log("[蛮族日常] 接取任务超过15秒，Questionable 可能卡住，正在重载...")
-                                yield("/qst reload")
+                            if Quests.IsQuestAccepted(questId) then
+                                break
+                            end
+
+                            if not IPC.Questionable.IsRunning() then
+                                -- Questionable 未运行：检查是否卡住
+                                if os.time() - timeout > 30 then
+                                    Dalamud.Log("[蛮族日常] Questionable 已停止超过30秒，可能卡住，正在重载...")
+                                    yield("/qst reload")
+                                    timeout = os.time()
+                                else
+                                    yield("/qst start")
+                                end
+                            else
+                                -- Questionable 正在运行（寻路、传送、等待加载等），重置超时计时器
                                 timeout = os.time()
                             end
-                            yield("/wait 0.1")
+
+                            yield("/wait 0.5")
                         until Quests.IsQuestAccepted(questId)
 
                         yield("/qst stop")
