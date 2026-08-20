@@ -12,7 +12,6 @@ SomethingNeedDoing (SND) 插件的中文汉化脚本合集。
 
 1. 已安装 [SomethingNeedDoing](https://github.com/PunsherXIV/SomethingNeedDoing) 插件
 2. 已安装各脚本所需的依赖插件（见上表）
-3. 游戏客户端语言设置为**简体中文**（脚本中的数据键值已通过 EXDViewer 和 XIVAPI v2 查询游戏底层数据表获取准确中文名）
 
 ## 脚本说明
 
